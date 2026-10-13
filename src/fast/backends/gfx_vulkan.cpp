@@ -22,6 +22,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -54,6 +56,13 @@ GfxRenderingAPIVK::GfxRenderingAPIVK(std::shared_ptr<Ship::ConsoleVariable> cons
                                      std::shared_ptr<Ship::ResourceManager> resourceManager)
     : mConsoleVariable(std::move(consoleVariable)) {
     sVKResourceManager = std::move(resourceManager);
+}
+
+GfxRenderingAPIVK::~GfxRenderingAPIVK() {
+    // A still-running std::thread would abort the process on destruction.
+    if (mPipelineCacheWriter.joinable()) {
+        mPipelineCacheWriter.join();
+    }
 }
 
 static std::shared_ptr<Ship::ResourceManager> vk_resource_manager() {
@@ -309,7 +318,81 @@ static std::string BuildVulkanShader(const CCFeatures& cc_features, bool vertex,
     return result;
 }
 
-static std::vector<uint32_t> CompileGlslToSpirv(const std::string& source, bool vertex) {
+// MARK: - On-disk caches
+//
+// shaderc turns each combiner's GLSL into SPIR-V the first time it is drawn,
+// and the driver turns SPIR-V plus render state into a pipeline. Both are slow
+// enough to drop frames, so both results are kept on disk across launches.
+
+static std::filesystem::path VulkanCacheDir() {
+    return std::filesystem::path(Ship::Context::GetPathRelativeToAppDirectory("cache")) / "vulkan";
+}
+
+// Writes through a temporary file so a crash mid-write never leaves a
+// truncated cache behind.
+static void WriteFileAtomically(const std::filesystem::path& path, const void* data, size_t size) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    const std::filesystem::path tmp = path.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return;
+        }
+        out.write(static_cast<const char*>(data), (std::streamsize)size);
+        if (!out) {
+            return;
+        }
+    }
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(tmp, ec);
+    }
+}
+
+static std::vector<char> ReadFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        return {};
+    }
+    const std::streamsize size = in.tellg();
+    std::vector<char> data(size > 0 ? (size_t)size : 0);
+    in.seekg(0);
+    if (size <= 0 || !in.read(data.data(), size)) {
+        return {};
+    }
+    return data;
+}
+
+// The SPIR-V cache is keyed by the GLSL text itself, which already folds in
+// the combiner, the prism template and the filter mode, so a template change
+// can never pick up stale SPIR-V.
+static uint64_t HashShaderSource(const std::string& source, bool vertex) {
+    uint64_t hash = 14695981039346656037ull; // FNV-1a
+    for (unsigned char c : source) {
+        hash = (hash ^ c) * 1099511628211ull;
+    }
+    return (hash ^ (vertex ? 'v' : 'f')) * 1099511628211ull;
+}
+
+static std::filesystem::path SpirvCachePath(const std::string& source, bool vertex) {
+    char name[32];
+    snprintf(name, sizeof(name), "%016llx.%s.spv", (unsigned long long)HashShaderSource(source, vertex),
+             vertex ? "vert" : "frag");
+    return VulkanCacheDir() / "spirv" / name;
+}
+
+static std::vector<uint32_t> LoadCachedSpirv(const std::filesystem::path& path) {
+    const std::vector<char> bytes = ReadFile(path);
+    if (bytes.size() < 20 || bytes.size() % 4 != 0) {
+        return {};
+    }
+    std::vector<uint32_t> words(bytes.size() / 4);
+    memcpy(words.data(), bytes.data(), bytes.size());
+    return words[0] == 0x07230203u ? words : std::vector<uint32_t>{}; // SPIR-V magic
+}
+
+static std::vector<uint32_t> CompileGlslToSpirvUncached(const std::string& source, bool vertex) {
     static shaderc::Compiler compiler;
     shaderc::CompileOptions options;
     options.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_1);
@@ -328,6 +411,19 @@ static std::vector<uint32_t> CompileGlslToSpirv(const std::string& source, bool 
         abort();
     }
     return { result.cbegin(), result.cend() };
+}
+
+static std::vector<uint32_t> CompileGlslToSpirv(const std::string& source, bool vertex) {
+    const std::filesystem::path path = SpirvCachePath(source, vertex);
+    std::vector<uint32_t> spirv = LoadCachedSpirv(path);
+    if (!spirv.empty()) {
+        return spirv;
+    }
+    spirv = CompileGlslToSpirvUncached(source, vertex);
+    if (!spirv.empty()) {
+        WriteFileAtomically(path, spirv.data(), spirv.size() * sizeof(uint32_t));
+    }
+    return spirv;
 }
 
 // MARK: - Helpers
@@ -639,6 +735,122 @@ void GfxRenderingAPIVK::DestroySwapchainViews() {
     mSwapchainViews.clear();
 }
 
+bool GfxRenderingAPIVK::ReadVsyncSetting() const {
+    // Fast3dWindow creates this backend without a console-variable handle, so
+    // fall back to the context's, as the SDL and DXGI window backends do.
+    std::shared_ptr<Ship::ConsoleVariable> cvars = mConsoleVariable;
+    if (cvars == nullptr && Ship::Context::GetRawInstance() != nullptr) {
+        cvars = Ship::Context::GetRawInstance()->GetConsoleVariables();
+    }
+    return cvars == nullptr || cvars->GetInteger(CVAR_VSYNC_ENABLED, 1) != 0;
+}
+
+// Vsync on: FIFO, the only mode every surface offers. Vsync off: IMMEDIATE,
+// which tears like DXGI's allow-tearing and lets a VRR display follow the
+// frame limiter; MAILBOX if the surface lacks it (no tearing, but the newest
+// frame replaces a queued one). FIFO if neither exists.
+VkPresentModeKHR GfxRenderingAPIVK::ChoosePresentMode(bool vsync) const {
+    if (vsync) {
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
+    uint32_t count = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(mPhysicalDevice, mSurface, &count, nullptr);
+    std::vector<VkPresentModeKHR> modes(count);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(mPhysicalDevice, mSurface, &count, modes.data());
+    for (VkPresentModeKHR wanted : { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR }) {
+        if (std::find(modes.begin(), modes.end(), wanted) != modes.end()) {
+            return wanted;
+        }
+    }
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+// The pipeline cache file starts with this header so that a driver update or
+// a different GPU discards it instead of handing the driver foreign data.
+struct PipelineCacheFileHeader {
+    char magic[8];
+    uint32_t vendorID;
+    uint32_t deviceID;
+    uint32_t driverVersion;
+    uint8_t pipelineCacheUUID[VK_UUID_SIZE];
+};
+static constexpr char kPipelineCacheMagic[8] = { 'L', 'U', 'S', 'V', 'K', 'P', 'C', '1' };
+
+static std::filesystem::path PipelineCachePath() {
+    return VulkanCacheDir() / "pipelines.bin";
+}
+
+static PipelineCacheFileHeader MakePipelineCacheHeader(const VkPhysicalDeviceProperties& props) {
+    PipelineCacheFileHeader header = {};
+    memcpy(header.magic, kPipelineCacheMagic, sizeof(header.magic));
+    header.vendorID = props.vendorID;
+    header.deviceID = props.deviceID;
+    header.driverVersion = props.driverVersion;
+    memcpy(header.pipelineCacheUUID, props.pipelineCacheUUID, VK_UUID_SIZE);
+    return header;
+}
+
+void GfxRenderingAPIVK::LoadPipelineCache() {
+    const std::vector<char> file = ReadFile(PipelineCachePath());
+    const PipelineCacheFileHeader expected = MakePipelineCacheHeader(mDeviceProps);
+    const bool usable = file.size() > sizeof(expected) && memcmp(file.data(), &expected, sizeof(expected)) == 0;
+    if (!file.empty() && !usable) {
+        SPDLOG_INFO("Vulkan: pipeline cache is from another GPU or driver; starting a new one");
+    }
+
+    VkPipelineCacheCreateInfo pcci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    if (usable) {
+        pcci.initialDataSize = file.size() - sizeof(expected);
+        pcci.pInitialData = file.data() + sizeof(expected);
+    }
+    if (vkCreatePipelineCache(mDevice, &pcci, nullptr, &mPipelineCache) != VK_SUCCESS && usable) {
+        // The driver rejected the data after all; an empty cache still works.
+        pcci.initialDataSize = 0;
+        pcci.pInitialData = nullptr;
+        VK_CHECK(vkCreatePipelineCache(mDevice, &pcci, nullptr, &mPipelineCache));
+    }
+    mPipelineCacheSavedMs = SDL_GetTicks64();
+}
+
+void GfxRenderingAPIVK::SavePipelineCache() {
+    if (mPipelineCache == VK_NULL_HANDLE || !mPipelineCacheDirty) {
+        return;
+    }
+    size_t size = 0;
+    if (vkGetPipelineCacheData(mDevice, mPipelineCache, &size, nullptr) != VK_SUCCESS || size == 0) {
+        return;
+    }
+    const PipelineCacheFileHeader header = MakePipelineCacheHeader(mDeviceProps);
+    std::vector<char> file(sizeof(header) + size);
+    memcpy(file.data(), &header, sizeof(header));
+    if (vkGetPipelineCacheData(mDevice, mPipelineCache, &size, file.data() + sizeof(header)) != VK_SUCCESS) {
+        return;
+    }
+    file.resize(sizeof(header) + size);
+    mPipelineCacheDirty = false;
+    mPipelineCacheSavedMs = SDL_GetTicks64();
+
+    if (mPipelineCacheWriter.joinable()) {
+        mPipelineCacheWriter.join();
+    }
+    mPipelineCacheWriter =
+        std::thread([file = std::move(file)]() { WriteFileAtomically(PipelineCachePath(), file.data(), file.size()); });
+}
+
+// Saves while play is running so a crash or a killed app (the norm on
+// Android) keeps what was compiled. Waits for a quiet spell, since new
+// pipelines come in bursts (a new map, a battle), and saves at most once a
+// minute; the file write itself runs on another thread.
+void GfxRenderingAPIVK::SavePipelineCacheIfIdle() {
+    if (!mPipelineCacheDirty) {
+        return;
+    }
+    const uint64_t now = SDL_GetTicks64();
+    if (now - mLastPipelineCreatedMs >= 5000 && now - mPipelineCacheSavedMs >= 60000) {
+        SavePipelineCache();
+    }
+}
+
 void GfxRenderingAPIVK::CreateSwapchain(uint32_t width, uint32_t height) {
     vkDeviceWaitIdle(mDevice);
     DestroySwapchainViews();
@@ -685,7 +897,8 @@ void GfxRenderingAPIVK::CreateSwapchain(uint32_t width, uint32_t height) {
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform = caps.currentTransform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    mPresentMode = ChoosePresentMode(mVsyncEnabled);
+    sci.presentMode = mPresentMode;
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = mSwapchain;
 
@@ -706,6 +919,10 @@ void GfxRenderingAPIVK::CreateSwapchain(uint32_t width, uint32_t height) {
         mSwapchainViews[i] = CreateImageView(mSwapchainImages[i], mSwapchainFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
     }
     mSwapchainImageUsed.assign(count, false);
+
+    static const char* const kPresentModeNames[] = { "IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED" };
+    SPDLOG_INFO("Vulkan: swapchain {}x{}, {} images, present mode {} (vsync {})", extent.width, extent.height, count,
+                (uint32_t)mPresentMode < 4 ? kPresentModeNames[mPresentMode] : "other", mVsyncEnabled ? "on" : "off");
 
     mSwapchainNeedsRecreate = false;
     RebuildScreenFramebuffer();
@@ -1003,7 +1220,10 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
         EndOneShot(cmd);
     }
 
+    LoadPipelineCache();
+
     // Initial swapchain
+    mVsyncEnabled = ReadVsyncSetting();
     int dw = 0, dh = 0;
     SDL_Vulkan_GetDrawableSize(window, &dw, &dh);
     CreateSwapchain((uint32_t)dw, (uint32_t)dh);
@@ -1030,6 +1250,11 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
 }
 
 void GfxRenderingAPIVK::ShutdownImGui() {
+    // Called once at exit; the last chance to keep this session's pipelines.
+    SavePipelineCache();
+    if (mPipelineCacheWriter.joinable()) {
+        mPipelineCacheWriter.join();
+    }
     if (mImGuiInitialized) {
         vkDeviceWaitIdle(mDevice);
         ImGui_ImplVulkan_Shutdown();
@@ -1104,6 +1329,11 @@ void GfxRenderingAPIVK::NewFrame() {
     mFrameUniformsDirty = true;
 
     // Swapchain housekeeping
+    const bool vsync = ReadVsyncSetting();
+    if (vsync != mVsyncEnabled) {
+        mVsyncEnabled = vsync;
+        mSwapchainNeedsRecreate = true;
+    }
     int dw = 0, dh = 0;
     SDL_Vulkan_GetDrawableSize(mWindow, &dw, &dh);
     if (mSwapchainNeedsRecreate || (uint32_t)dw != mSwapchainExtent.width || (uint32_t)dh != mSwapchainExtent.height) {
@@ -1576,7 +1806,9 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
     pci.subpass = 0;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult res = vkCreateGraphicsPipelines(mDevice, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline);
+    VkResult res = vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline);
+    mPipelineCacheDirty = true;
+    mLastPipelineCreatedMs = SDL_GetTicks64();
     if (res != VK_SUCCESS) {
         SPDLOG_ERROR("Vulkan: pipeline creation failed ({}) for shader {:x}/{:x}", (int)res, prg->shader_id0,
                      prg->shader_id1);
@@ -2394,6 +2626,7 @@ void GfxRenderingAPIVK::EndFrame() {
     mDrawnFramebuffers.clear();
     mFrameActive = false;
     mFrameSlot = (mFrameSlot + 1) % VK_FRAMES_IN_FLIGHT;
+    SavePipelineCacheIfIdle();
 }
 
 void GfxRenderingAPIVK::FinishRender() {

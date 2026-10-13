@@ -16,6 +16,7 @@
 
 #include <vulkan/vulkan.h>
 #include <unordered_map>
+#include <thread>
 #include <vector>
 #include <map>
 
@@ -156,7 +157,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
                       std::shared_ptr<Ship::ResourceManager> resourceManager = nullptr);
 
     std::shared_ptr<Ship::ConsoleVariable> ConsoleVariables() const;
-    ~GfxRenderingAPIVK() override = default;
+    ~GfxRenderingAPIVK() override;
     const char* GetName() override;
     int GetMaxTextureSize() override;
     GfxClipParameters GetClipParameters() override;
@@ -260,6 +261,11 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     // replacement = 64 MB > the 32 MB default). Caller must ensure the queue is idle.
     void GrowStaging(FrameSlot& slot, size_t needed);
     void CreateSwapchain(uint32_t width, uint32_t height);
+    VkPresentModeKHR ChoosePresentMode(bool vsync) const;
+    bool ReadVsyncSetting() const;
+    void LoadPipelineCache();
+    void SavePipelineCache();
+    void SavePipelineCacheIfIdle();
     void DestroySwapchainViews();
     void RebuildScreenFramebuffer();
     void EnsurePassActive(int fbId);
@@ -293,6 +299,17 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     std::vector<bool> mSwapchainImageUsed; // first-use layout tracking
     uint32_t mSwapchainImageIndex = 0;
     bool mSwapchainNeedsRecreate = false;
+    // Present mode follows the vsync setting; the swapchain is recreated when it changes.
+    bool mVsyncEnabled = true;
+    VkPresentModeKHR mPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+
+    // Pipelines persist across launches: the driver's own cache, saved to disk
+    // and keyed by the device and driver so an update throws it away.
+    VkPipelineCache mPipelineCache = VK_NULL_HANDLE;
+    bool mPipelineCacheDirty = false;
+    uint64_t mLastPipelineCreatedMs = 0;
+    uint64_t mPipelineCacheSavedMs = 0;
+    std::thread mPipelineCacheWriter; // writes the file off the render thread
     bool mFrameActive = false;
 
     FrameSlot mFrames[VK_FRAMES_IN_FLIGHT];
