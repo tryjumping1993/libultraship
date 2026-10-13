@@ -16,7 +16,10 @@
 
 #include <vulkan/vulkan.h>
 #include <unordered_map>
+#include <atomic>
+#include <set>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <map>
 
@@ -80,6 +83,9 @@ struct ShaderProgramVK {
     bool usedLighting = false;
     bool useAlphaBlend = false;
     bool markedForDeletion = false;
+    // Built from the stock template, so safe to rebuild at start-up before the
+    // game has registered its custom shaders.
+    bool prewarmable = false;
 
     VkShaderModule vs = VK_NULL_HANDLE;
     VkShaderModule fs = VK_NULL_HANDLE;
@@ -206,6 +212,8 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     void SetTextureFilter(FilteringMode mode) override;
     FilteringMode GetTextureFilter() override;
     ImTextureID GetTextureById(int id) override;
+    void SetMaxFrameLatency(int latency) override;
+    bool CanDisableVsync() override;
 
     // Called from Fast3dGui (mirrors the Metal backend's custom ImGui hooks)
     bool VulkanInit(SDL_Window* window);
@@ -253,7 +261,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     void FullBarrier(VkCommandBuffer cmd);
     VkCommandBuffer BeginOneShot();
     void EndOneShot(VkCommandBuffer cmd);
-    VkRenderPass GetRenderPass(uint32_t msaaLevel, bool hasDepth);
+    VkRenderPass GetRenderPass(uint32_t msaaLevel, bool hasDepth, bool clearColor = false, bool clearDepth = false);
     VkSampler GetSampler(bool linear, uint32_t cms, uint32_t cmt, bool autoMipmap = false);
     void EnsureUploadCmd();
     void FlushUploads();
@@ -262,16 +270,25 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     void GrowStaging(FrameSlot& slot, size_t needed);
     void CreateSwapchain(uint32_t width, uint32_t height);
     VkPresentModeKHR ChoosePresentMode(bool vsync) const;
+    void ApplyFrameLatency();
+    void WaitForPresentLatency();
+    void ReportDisplayTimes();
     bool ReadVsyncSetting() const;
     void LoadPipelineCache();
     void SavePipelineCache();
     void SavePipelineCacheIfIdle();
     void DestroySwapchainViews();
     void RebuildScreenFramebuffer();
-    void EnsurePassActive(int fbId);
+    void EnsureCommandBuffer(int fbId);
+    void EnsurePassActive(int fbId, bool clearColor = false, bool clearDepth = false);
     void EndPass(FramebufferVK& fb);
     void RestartPass(FramebufferVK& fb);
     VkPipeline GetPipelineForState(ShaderProgramVK* prg, FramebufferVK& fb);
+    VkPipeline CreatePipeline(const ShaderProgramVK& prg, uint32_t key, VkRenderPass pass) const;
+    void LoadPrewarmList();
+    void RunPrewarm();
+    void MergePrewarmedPipelines();
+    void FinishPrewarm();
     void WriteDrawUniformsIfDirty();
     void SubmitFramebufferAndWait(int fbId);
     void CollectGarbage(FrameSlot& slot);
@@ -302,6 +319,8 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     // Present mode follows the vsync setting; the swapchain is recreated when it changes.
     bool mVsyncEnabled = true;
     VkPresentModeKHR mPresentMode = VK_PRESENT_MODE_FIFO_KHR;
+    bool mLoggedSurfaceTransform = false;
+    bool mCanDisableVsync = true; // until the first swapchain has looked
 
     // Pipelines persist across launches: the driver's own cache, saved to disk
     // and keyed by the device and driver so an update throws it away.
@@ -310,7 +329,49 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     uint64_t mLastPipelineCreatedMs = 0;
     uint64_t mPipelineCacheSavedMs = 0;
     std::thread mPipelineCacheWriter; // writes the file off the render thread
+
+    // Start-up prewarm: every (shader, pipeline state) an earlier session drew,
+    // so a second launch meets no pipeline it has to build mid-game. Programs
+    // are rebuilt on the render thread a few per frame, then their pipelines
+    // are created on a worker and picked up between frames.
+    using PipelineRecord = std::tuple<uint64_t, uint64_t, uint32_t>; // shader ids, state key
+    std::set<PipelineRecord> mSeenPipelines;
+    bool mSeenPipelinesDirty = false;
+    std::vector<PipelineRecord> mPrewarmList;
+    size_t mPrewarmNext = 0;
+    uint32_t mPrewarmFramesWaited = 0;
+    struct PrewarmJob {
+        ShaderProgramVK* prg;
+        uint32_t key;
+        VkRenderPass pass;
+        VkPipeline pipeline;
+    };
+    std::vector<PrewarmJob> mPrewarmJobs;
+    std::atomic<size_t> mPrewarmJobsDone{ 0 };
+    size_t mPrewarmJobsMerged = 0;
+    std::thread mPrewarmWorker;
     bool mFrameActive = false;
+
+    // Frames the CPU may record before the oldest one has left the GPU:
+    // SetMaxFrameLatency + 1, at most VK_FRAMES_IN_FLIGHT. Changed between frames.
+    uint32_t mFramesInFlight = VK_FRAMES_IN_FLIGHT;
+    uint32_t mFrameLatency = VK_FRAMES_IN_FLIGHT - 1;
+    uint32_t mWantedFrameLatency = VK_FRAMES_IN_FLIGHT - 1;
+
+    // VK_KHR_present_id + VK_KHR_present_wait: a frame starts only once the
+    // frame mFrameLatency presents back is on screen, the counterpart of DXGI's
+    // frame-latency waitable object. Its completion is also the present time
+    // reported through PresentTiming.h when display timing is missing.
+    bool mHasPresentWait = false;
+    PFN_vkWaitForPresentKHR mWaitForPresent = nullptr;
+    uint64_t mPresentId = 0;               // last id given to vkQueuePresentKHR
+    uint64_t mSwapchainFirstPresentId = 1; // ids below went to an older swapchain
+    uint64_t mPresentWaitedId = 0;         // last id waited for
+
+    // VK_GOOGLE_display_timing (Android): when each frame actually showed.
+    bool mHasDisplayTiming = false;
+    PFN_vkGetPastPresentationTimingGOOGLE mGetPastPresentationTiming = nullptr;
+    PFN_vkGetRefreshCycleDurationGOOGLE mGetRefreshCycleDuration = nullptr;
 
     FrameSlot mFrames[VK_FRAMES_IN_FLIGHT];
     uint32_t mFrameSlot = 0;
@@ -327,7 +388,7 @@ class GfxRenderingAPIVK final : public GfxRenderingAPI {
     VkDescriptorSetLayout mSet1Layout = VK_NULL_HANDLE; // 7 combined image samplers
     VkPipelineLayout mPipelineLayout = VK_NULL_HANDLE;
 
-    std::map<uint32_t, VkRenderPass> mRenderPassCache; // key: msaa | (hasDepth << 8)
+    std::map<uint32_t, VkRenderPass> mRenderPassCache; // key: msaa | hasDepth << 8 | clearColor << 9 | clearDepth << 10
     std::map<uint32_t, VkSampler> mSamplerCache;       // key: linear | cms<<1 | cmt<<9
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, ShaderProgramVK, vk_hash_pair_shader_ids> mShaderProgramPool;

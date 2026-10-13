@@ -8019,6 +8019,7 @@ void Interpreter::SetTargetFps(int fps) {
 
 void Interpreter::SetMaxFrameLatency(int latency) {
     mWapi->SetMaxFrameLatency(latency);
+    mRapi->SetMaxFrameLatency(latency);
 }
 
 int Interpreter::CreateFrameBuffer(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height,

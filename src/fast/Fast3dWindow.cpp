@@ -335,7 +335,7 @@ bool Fast3dWindow::SupportsWindowedFullscreen() {
 }
 
 bool Fast3dWindow::CanDisableVerticalSync() {
-    return mWindowManagerApi->CanDisableVsync();
+    return mWindowManagerApi->CanDisableVsync() && mRenderingApi->CanDisableVsync();
 }
 
 void Fast3dWindow::SetResolutionMultiplier(float multiplier) {

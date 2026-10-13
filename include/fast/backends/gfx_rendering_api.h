@@ -214,6 +214,14 @@ class GfxRenderingAPI {
     virtual void SetCullMode(int8_t keepSign) {
         mCurrentCullKeepSign = keepSign;
     }
+    // How many frames the CPU may queue ahead of the display. Backends that own
+    // their swapchain (Vulkan) apply it; the others leave it to the window backend.
+    virtual void SetMaxFrameLatency(int latency) {
+    }
+    // False when this renderer's surface cannot present without vsync.
+    virtual bool CanDisableVsync() {
+        return true;
+    }
 
   protected:
     int8_t mCurrentDepthTest = 0;

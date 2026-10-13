@@ -21,9 +21,13 @@
 
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#if defined(__linux__)
+#include <time.h>
+#endif
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
@@ -38,6 +42,7 @@
 #include "ship/Context.h"
 #include "ship/resource/ResourceManager.h"
 #include "ship/resource/factory/ShaderFactory.h"
+#include "fast/PresentTiming.h"
 #include <sstream>
 
 #define VK_CHECK(expr)                                                          \
@@ -60,6 +65,9 @@ GfxRenderingAPIVK::GfxRenderingAPIVK(std::shared_ptr<Ship::ConsoleVariable> cons
 
 GfxRenderingAPIVK::~GfxRenderingAPIVK() {
     // A still-running std::thread would abort the process on destruction.
+    if (mPrewarmWorker.joinable()) {
+        mPrewarmWorker.join();
+    }
     if (mPipelineCacheWriter.joinable()) {
         mPipelineCacheWriter.join();
     }
@@ -561,8 +569,12 @@ void GfxRenderingAPIVK::EndOneShot(VkCommandBuffer cmd) {
 
 // Canonical render pass per (msaa, hasDepth). All attachments LOAD/STORE in
 // LAYOUT_GENERAL; MSAA passes add a resolve attachment (the sampled texture).
-VkRenderPass GfxRenderingAPIVK::GetRenderPass(uint32_t msaaLevel, bool hasDepth) {
-    uint32_t key = msaaLevel | (hasDepth ? 1u << 8 : 0);
+// The clear variants differ only in load ops, so they are compatible with the
+// same framebuffers and pipelines: a pass that starts with a full clear loads
+// nothing from memory, which on a tiled GPU (Adreno) saves a full read.
+VkRenderPass GfxRenderingAPIVK::GetRenderPass(uint32_t msaaLevel, bool hasDepth, bool clearColor, bool clearDepth) {
+    clearDepth = clearDepth && hasDepth;
+    uint32_t key = msaaLevel | (hasDepth ? 1u << 8 : 0) | (clearColor ? 1u << 9 : 0) | (clearDepth ? 1u << 10 : 0);
     auto it = mRenderPassCache.find(key);
     if (it != mRenderPassCache.end()) {
         return it->second;
@@ -574,7 +586,7 @@ VkRenderPass GfxRenderingAPIVK::GetRenderPass(uint32_t msaaLevel, bool hasDepth)
     VkAttachmentDescription color = {};
     color.format = mSwapchainFormat;
     color.samples = (VkSampleCountFlagBits)msaaLevel;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.loadOp = clearColor ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
     color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -598,7 +610,7 @@ VkRenderPass GfxRenderingAPIVK::GetRenderPass(uint32_t msaaLevel, bool hasDepth)
         VkAttachmentDescription depth = {};
         depth.format = VK_FORMAT_D32_SFLOAT;
         depth.samples = (VkSampleCountFlagBits)msaaLevel;
-        depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth.loadOp = clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
         depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -620,13 +632,14 @@ VkRenderPass GfxRenderingAPIVK::GetRenderPass(uint32_t msaaLevel, bool hasDepth)
     VkSubpassDependency deps[2] = {};
     deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass = 0;
+    // The subpass side may only name graphics stages.
     deps[0].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    deps[0].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[0].dstStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
     deps[0].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     deps[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     deps[1].srcSubpass = 0;
     deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    deps[1].srcStageMask = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
     deps[1].dstStageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     deps[1].srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     deps[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -765,6 +778,93 @@ VkPresentModeKHR GfxRenderingAPIVK::ChoosePresentMode(bool vsync) const {
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
+// Asked every frame, so answered from the swapchain's last look at the surface.
+bool GfxRenderingAPIVK::CanDisableVsync() {
+    return mCanDisableVsync;
+}
+
+void GfxRenderingAPIVK::SetMaxFrameLatency(int latency) {
+    mWantedFrameLatency = (uint32_t)std::clamp(latency, 1, (int)VK_FRAMES_IN_FLIGHT - 1);
+}
+
+// Frames in flight change only between frames, with the GPU idle, so no slot
+// is dropped while its fence or garbage is still pending.
+void GfxRenderingAPIVK::ApplyFrameLatency() {
+    if (mWantedFrameLatency == mFrameLatency) {
+        return;
+    }
+    vkDeviceWaitIdle(mDevice);
+    for (uint32_t i = 0; i < VK_FRAMES_IN_FLIGHT; i++) {
+        FrameSlot& slot = mFrames[i];
+        if (slot.fenceInFlight) {
+            VK_CHECK(vkResetFences(mDevice, 1, &slot.fence));
+            slot.fenceInFlight = false;
+        }
+        CollectGarbage(slot);
+    }
+    mFrameLatency = mWantedFrameLatency;
+    mFramesInFlight = mFrameLatency + 1;
+    mFrameSlot = 0;
+    SPDLOG_INFO("Vulkan: frame latency {}, {} frames in flight{}", mFrameLatency, mFramesInFlight,
+                mHasPresentWait ? ", waiting on presents" : "");
+}
+
+static int64_t SteadyClockNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Starting frame N waits until frame N - latency is on screen. Without this,
+// FIFO lets the CPU run a whole swapchain ahead of the display.
+void GfxRenderingAPIVK::WaitForPresentLatency() {
+    if (!mHasPresentWait || mSwapchain == VK_NULL_HANDLE || mPresentId + 1 <= mFrameLatency) {
+        return;
+    }
+    const uint64_t target = mPresentId + 1 - mFrameLatency;
+    if (target < mSwapchainFirstPresentId || target <= mPresentWaitedId) {
+        return;
+    }
+    // A timeout keeps a hidden or minimised window from hanging the game.
+    constexpr uint64_t kTimeoutNs = 100ull * 1000 * 1000;
+    const VkResult result = mWaitForPresent(mDevice, mSwapchain, target, kTimeoutNs);
+    mPresentWaitedId = target;
+    if (result == VK_SUCCESS && !mHasDisplayTiming) {
+        // The wait returns as the frame begins to show. When it had already
+        // shown, this is later than the truth, which the CPU-side measure is too.
+        ReportPresentTime(SteadyClockNowNs());
+    } else if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        mSwapchainNeedsRecreate = true;
+    }
+}
+
+// VK_GOOGLE_display_timing reports, a few frames late, when each present
+// actually showed, on CLOCK_MONOTONIC.
+void GfxRenderingAPIVK::ReportDisplayTimes() {
+    if (!mHasDisplayTiming || !HasPresentTimeCallback()) {
+        return;
+    }
+    uint32_t count = 0;
+    if (mGetPastPresentationTiming(mDevice, mSwapchain, &count, nullptr) != VK_SUCCESS || count == 0) {
+        return;
+    }
+    std::vector<VkPastPresentationTimingGOOGLE> timings(count);
+    if (mGetPastPresentationTiming(mDevice, mSwapchain, &count, timings.data()) != VK_SUCCESS) {
+        return;
+    }
+#if defined(__linux__)
+    timespec ts = {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t monotonicToSteady = SteadyClockNowNs() - ((int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec);
+#else
+    const int64_t monotonicToSteady = 0;
+#endif
+    for (uint32_t i = 0; i < count; i++) {
+        if (timings[i].actualPresentTime != 0) {
+            ReportPresentTime((int64_t)timings[i].actualPresentTime + monotonicToSteady);
+        }
+    }
+}
+
 // The pipeline cache file starts with this header so that a driver update or
 // a different GPU discards it instead of handing the driver foreign data.
 struct PipelineCacheFileHeader {
@@ -779,6 +879,16 @@ static constexpr char kPipelineCacheMagic[8] = { 'L', 'U', 'S', 'V', 'K', 'P', '
 static std::filesystem::path PipelineCachePath() {
     return VulkanCacheDir() / "pipelines.bin";
 }
+
+// Which pipelines were drawn, as text: one "shader id0, shader id1, state key"
+// per line. Independent of the driver, so it survives driver updates that
+// throw away pipelines.bin, which is when the prewarm helps most.
+static std::filesystem::path PipelineListPath() {
+    return VulkanCacheDir() / "pipelines.txt";
+}
+
+// More than a session of play ever draws; a bound on a corrupt file.
+static constexpr size_t kMaxPrewarmPipelines = 8192;
 
 static PipelineCacheFileHeader MakePipelineCacheHeader(const VkPhysicalDeviceProperties& props) {
     PipelineCacheFileHeader header = {};
@@ -810,6 +920,7 @@ void GfxRenderingAPIVK::LoadPipelineCache() {
         VK_CHECK(vkCreatePipelineCache(mDevice, &pcci, nullptr, &mPipelineCache));
     }
     mPipelineCacheSavedMs = SDL_GetTicks64();
+    LoadPrewarmList();
 }
 
 void GfxRenderingAPIVK::SavePipelineCache() {
@@ -830,11 +941,25 @@ void GfxRenderingAPIVK::SavePipelineCache() {
     mPipelineCacheDirty = false;
     mPipelineCacheSavedMs = SDL_GetTicks64();
 
+    std::string list;
+    if (mSeenPipelinesDirty) {
+        for (const auto& [id0, id1, key] : mSeenPipelines) {
+            char line[64];
+            snprintf(line, sizeof(line), "%016llx %016llx %x\n", (unsigned long long)id0, (unsigned long long)id1, key);
+            list += line;
+        }
+        mSeenPipelinesDirty = false;
+    }
+
     if (mPipelineCacheWriter.joinable()) {
         mPipelineCacheWriter.join();
     }
-    mPipelineCacheWriter =
-        std::thread([file = std::move(file)]() { WriteFileAtomically(PipelineCachePath(), file.data(), file.size()); });
+    mPipelineCacheWriter = std::thread([file = std::move(file), list = std::move(list)]() {
+        WriteFileAtomically(PipelineCachePath(), file.data(), file.size());
+        if (!list.empty()) {
+            WriteFileAtomically(PipelineListPath(), list.data(), list.size());
+        }
+    });
 }
 
 // Saves while play is running so a crash or a killed app (the norm on
@@ -878,6 +1003,14 @@ void GfxRenderingAPIVK::CreateSwapchain(uint32_t width, uint32_t height) {
         extent = { std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width),
                    std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height) };
     }
+    // With the image left unrotated it must have the window's orientation; a
+    // surface that reports its extent in the panel's native one is swapped back,
+    // or NewFrame would see a size change every frame.
+    const bool rotated = (caps.currentTransform &
+                          (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) != 0;
+    if (rotated && (extent.width > extent.height) != (width > height) && width != height) {
+        std::swap(extent.width, extent.height);
+    }
     mSwapchainExtent = extent;
 
     uint32_t imageCount = std::max(caps.minImageCount + 1, 3u);
@@ -895,9 +1028,22 @@ void GfxRenderingAPIVK::CreateSwapchain(uint32_t width, uint32_t height) {
     sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
+    // Declaring currentTransform promises the image is already rotated to the
+    // panel's native orientation, which this renderer does not do: a rotated
+    // surface (an Android panel mounted portrait, shown landscape) would come out
+    // sideways. Identity lets the compositor rotate it; on Android that may cost
+    // a composition pass, which the log line below makes visible.
+    sci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                           ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
+                           : caps.currentTransform;
+    if (caps.currentTransform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR && !mLoggedSurfaceTransform) {
+        SPDLOG_INFO("Vulkan: surface transform {:#x}; the compositor rotates each frame",
+                    (uint32_t)caps.currentTransform);
+        mLoggedSurfaceTransform = true;
+    }
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     mPresentMode = ChoosePresentMode(mVsyncEnabled);
+    mCanDisableVsync = ChoosePresentMode(false) != VK_PRESENT_MODE_FIFO_KHR;
     sci.presentMode = mPresentMode;
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = mSwapchain;
@@ -923,6 +1069,16 @@ void GfxRenderingAPIVK::CreateSwapchain(uint32_t width, uint32_t height) {
     static const char* const kPresentModeNames[] = { "IMMEDIATE", "MAILBOX", "FIFO", "FIFO_RELAXED" };
     SPDLOG_INFO("Vulkan: swapchain {}x{}, {} images, present mode {} (vsync {})", extent.width, extent.height, count,
                 (uint32_t)mPresentMode < 4 ? kPresentModeNames[mPresentMode] : "other", mVsyncEnabled ? "on" : "off");
+
+    // Present ids keep counting across swapchains, but one can only wait on
+    // ids it was given itself.
+    mSwapchainFirstPresentId = mPresentId + 1;
+    if (mHasDisplayTiming) {
+        VkRefreshCycleDurationGOOGLE refresh = {};
+        if (mGetRefreshCycleDuration(mDevice, mSwapchain, &refresh) == VK_SUCCESS && refresh.refreshDuration > 0) {
+            SPDLOG_INFO("Vulkan: display refresh {:.3f} Hz", 1e9 / (double)refresh.refreshDuration);
+        }
+    }
 
     mSwapchainNeedsRecreate = false;
     RebuildScreenFramebuffer();
@@ -1070,7 +1226,22 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
     std::vector<VkExtensionProperties> devExts(devExtCount);
     vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &devExtCount, devExts.data());
     std::vector<const char*> enabledDevExts = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    bool hasPresentIdExt = false;
+    bool hasPresentWaitExt = false;
     for (const auto& e : devExts) {
+        if (strcmp(e.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0) {
+            hasPresentIdExt = true;
+        }
+        if (strcmp(e.extensionName, VK_KHR_PRESENT_WAIT_EXTENSION_NAME) == 0) {
+            hasPresentWaitExt = true;
+        }
+#if defined(__linux__)
+        // Only where its clock is known to be CLOCK_MONOTONIC (Android, Linux).
+        if (strcmp(e.extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0) {
+            enabledDevExts.push_back(VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME);
+            mHasDisplayTiming = true;
+        }
+#endif
         if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) {
             enabledDevExts.push_back("VK_KHR_portability_subset");
         }
@@ -1095,17 +1266,61 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
     mHasDepthClamp = supported.depthClamp;
     mHasAnisotropy = supported.samplerAnisotropy;
 
+    // Present wait needs its features switched on through VkPhysicalDeviceFeatures2.
+    // Looked up rather than linked: Android's libvulkan only exports 1.1 entry
+    // points from API 28, and the app starts on 24.
+    VkPhysicalDevicePresentWaitFeaturesKHR presentWaitFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR
+    };
+    VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR
+    };
+    presentIdFeatures.pNext = &presentWaitFeatures;
+    VkPhysicalDeviceFeatures2 features2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    features2.pNext = &presentIdFeatures;
+    auto getFeatures2 =
+        (PFN_vkGetPhysicalDeviceFeatures2)vkGetInstanceProcAddr(mInstance, "vkGetPhysicalDeviceFeatures2");
+    if (hasPresentIdExt && hasPresentWaitExt && getFeatures2 != nullptr &&
+        mDeviceProps.apiVersion >= VK_API_VERSION_1_1) {
+        getFeatures2(mPhysicalDevice, &features2);
+        mHasPresentWait = presentIdFeatures.presentId && presentWaitFeatures.presentWait;
+    }
+    if (mHasPresentWait) {
+        enabledDevExts.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+        enabledDevExts.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+        presentIdFeatures.presentId = VK_TRUE;
+        presentWaitFeatures.presentWait = VK_TRUE;
+        features2.features = features;
+    }
+
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = (uint32_t)enabledDevExts.size();
     dci.ppEnabledExtensionNames = enabledDevExts.data();
-    dci.pEnabledFeatures = &features;
+    if (mHasPresentWait) {
+        dci.pNext = &features2;
+    } else {
+        dci.pEnabledFeatures = &features;
+    }
     if (vkCreateDevice(mPhysicalDevice, &dci, nullptr, &mDevice) != VK_SUCCESS) {
         SPDLOG_ERROR("Vulkan: vkCreateDevice failed");
         return false;
     }
     vkGetDeviceQueue(mDevice, mQueueFamily, 0, &mQueue);
+    if (mHasPresentWait) {
+        mWaitForPresent = (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(mDevice, "vkWaitForPresentKHR");
+        mHasPresentWait = mWaitForPresent != nullptr;
+    }
+    if (mHasDisplayTiming) {
+        mGetPastPresentationTiming =
+            (PFN_vkGetPastPresentationTimingGOOGLE)vkGetDeviceProcAddr(mDevice, "vkGetPastPresentationTimingGOOGLE");
+        mGetRefreshCycleDuration =
+            (PFN_vkGetRefreshCycleDurationGOOGLE)vkGetDeviceProcAddr(mDevice, "vkGetRefreshCycleDurationGOOGLE");
+        mHasDisplayTiming = mGetPastPresentationTiming != nullptr && mGetRefreshCycleDuration != nullptr;
+    }
+    SPDLOG_INFO("Vulkan: present wait {}, display timing {}", mHasPresentWait ? "yes" : "no",
+                mHasDisplayTiming ? "yes" : "no");
 
     // Descriptor set layouts + pipeline layout
     {
@@ -1251,6 +1466,7 @@ bool GfxRenderingAPIVK::VulkanInit(SDL_Window* window) {
 
 void GfxRenderingAPIVK::ShutdownImGui() {
     // Called once at exit; the last chance to keep this session's pipelines.
+    FinishPrewarm();
     SavePipelineCache();
     if (mPipelineCacheWriter.joinable()) {
         mPipelineCacheWriter.join();
@@ -1283,6 +1499,12 @@ void GfxRenderingAPIVK::CollectGarbage(FrameSlot& slot) {
 }
 
 void GfxRenderingAPIVK::NewFrame() {
+    ApplyFrameLatency();
+    WaitForPresentLatency();
+    RunPrewarm();
+    if (!mPrewarmJobs.empty()) {
+        MergePrewarmedPipelines();
+    }
     FrameSlot& slot = mFrames[mFrameSlot];
 
     if (slot.fenceInFlight) {
@@ -1442,6 +1664,7 @@ ShaderProgram* GfxRenderingAPIVK::CreateAndLoadNewShader(uint64_t shaderId0, uin
     prg->usedLighting = cc_features.opt_lighting || cc_features.opt_texgen;
     prg->useAlphaBlend = cc_features.opt_alpha;
     prg->markedForDeletion = false;
+    prg->prewarmable = (uint16_t)cc_features.shader_id == 0xFFFF;
     prg->pipelines.clear();
 
     VkShaderModuleCreateInfo smci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -1486,6 +1709,7 @@ ShaderProgram* GfxRenderingAPIVK::LookupShader(uint64_t shaderId0, uint64_t shad
         return nullptr;
     }
     if (it->second.markedForDeletion) {
+        FinishPrewarm(); // the worker may be building one of its pipelines
         vkDeviceWaitIdle(mDevice);
         for (auto& [key, pipeline] : it->second.pipelines) {
             vkDestroyPipeline(mDevice, pipeline, nullptr);
@@ -1699,6 +1923,17 @@ void GfxRenderingAPIVK::SetUseAlpha(bool useAlpha) {
     // Blend state comes from the shader's opt_alpha (baked into the pipeline)
 }
 
+// State key layout: msaa level (bits 0-3), has depth buffer (4), depth write
+// (5), compare op (6-7: 0 always, 1 less, 2 lequal, 3 equal), cull (8-9: 0 none,
+// 1 front, 2 back), depth bias (10). Everything a pipeline needs beyond the
+// shader, so the start-up prewarm can rebuild one from a saved key.
+static uint32_t VkKeyMsaa(uint32_t key) {
+    return key & 0xF;
+}
+static bool VkKeyHasDepth(uint32_t key) {
+    return (key >> 4) & 1;
+}
+
 // Lazily creates the pipeline for the current depth/cull/framebuffer state.
 VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, FramebufferVK& fb) {
     // Derive the depth compare op the same way Metal does
@@ -1720,24 +1955,54 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
     if (it != prg->pipelines.end()) {
         return it->second;
     }
+    if (!mPrewarmJobs.empty()) {
+        MergePrewarmedPipelines();
+        it = prg->pipelines.find(key);
+        if (it != prg->pipelines.end()) {
+            return it->second;
+        }
+    }
+
+    VkPipeline pipeline = CreatePipeline(*prg, key, GetRenderPass(fb.mMsaaLevel, fb.mHasDepthBuffer));
+    mPipelineCacheDirty = true;
+    mLastPipelineCreatedMs = SDL_GetTicks64();
+    if (pipeline == VK_NULL_HANDLE) {
+        SPDLOG_ERROR("Vulkan: pipeline creation failed for shader {:x}/{:x}", prg->shader_id0, prg->shader_id1);
+    } else if (prg->prewarmable && mSeenPipelines.size() < kMaxPrewarmPipelines &&
+               mSeenPipelines.emplace(prg->shader_id0, prg->shader_id1, key).second) {
+        mSeenPipelinesDirty = true;
+    }
+    prg->pipelines[key] = pipeline;
+    return pipeline;
+}
+
+// Reads only immutable device state and the program's modules, so the
+// prewarm worker can call it while the render thread runs.
+VkPipeline GfxRenderingAPIVK::CreatePipeline(const ShaderProgramVK& prg, uint32_t key, VkRenderPass pass) const {
+    const uint32_t msaaLevel = VkKeyMsaa(key);
+    const bool hasDepth = VkKeyHasDepth(key);
+    const bool depthMask = (key >> 5) & 1;
+    const uint32_t compareSel = (key >> 6) & 3;
+    const uint32_t cullSel = (key >> 8) & 3;
+    const bool depthBias = (key >> 10) & 1;
 
     VkPipelineShaderStageCreateInfo stages[2] = {};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = prg->vs;
+    stages[0].module = prg.vs;
     stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = prg->fs;
+    stages[1].module = prg.fs;
     stages[1].pName = "main";
 
-    VkVertexInputBindingDescription binding = { 0, prg->numFloats * (uint32_t)sizeof(float),
+    VkVertexInputBindingDescription binding = { 0, prg.numFloats * (uint32_t)sizeof(float),
                                                 VK_VERTEX_INPUT_RATE_VERTEX };
     VkPipelineVertexInputStateCreateInfo vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = prg->attribCount;
-    vertexInput.pVertexAttributeDescriptions = prg->attribs;
+    vertexInput.vertexAttributeDescriptionCount = prg.attribCount;
+    vertexInput.pVertexAttributeDescriptions = prg.attribs;
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly = {
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
@@ -1758,11 +2023,13 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
     raster.depthClampEnable = mHasDepthClamp ? VK_TRUE : VK_FALSE;
 
     VkPipelineMultisampleStateCreateInfo msaa = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
-    msaa.rasterizationSamples = (VkSampleCountFlagBits)fb.mMsaaLevel;
+    msaa.rasterizationSamples = (VkSampleCountFlagBits)msaaLevel;
 
+    // compareSel 0 means the depth test is off; the test stays enabled with
+    // ALWAYS when only depth writes are on.
     VkPipelineDepthStencilStateCreateInfo depth = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
-    depth.depthTestEnable = fb.mHasDepthBuffer && (mCurrentDepthTest || mCurrentDepthMask) ? VK_TRUE : VK_FALSE;
-    depth.depthWriteEnable = fb.mHasDepthBuffer && mCurrentDepthMask ? VK_TRUE : VK_FALSE;
+    depth.depthTestEnable = hasDepth && (compareSel != 0 || depthMask) ? VK_TRUE : VK_FALSE;
+    depth.depthWriteEnable = hasDepth && depthMask ? VK_TRUE : VK_FALSE;
     static const VkCompareOp compareOps[4] = { VK_COMPARE_OP_ALWAYS, VK_COMPARE_OP_LESS, VK_COMPARE_OP_LESS_OR_EQUAL,
                                                VK_COMPARE_OP_EQUAL };
     depth.depthCompareOp = compareOps[compareSel];
@@ -1770,7 +2037,7 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
     VkPipelineColorBlendAttachmentState blendAttachment = {};
     blendAttachment.colorWriteMask =
         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    if (prg->useAlphaBlend) {
+    if (prg.useAlphaBlend) {
         blendAttachment.blendEnable = VK_TRUE;
         blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
         blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -1802,19 +2069,142 @@ VkPipeline GfxRenderingAPIVK::GetPipelineForState(ShaderProgramVK* prg, Framebuf
     pci.pColorBlendState = &blend;
     pci.pDynamicState = &dynamic;
     pci.layout = mPipelineLayout;
-    pci.renderPass = GetRenderPass(fb.mMsaaLevel, fb.mHasDepthBuffer);
+    pci.renderPass = pass;
     pci.subpass = 0;
 
+    // The pipeline cache is internally synchronised, so the worker and the
+    // render thread may both create through it.
     VkPipeline pipeline = VK_NULL_HANDLE;
-    VkResult res = vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline);
-    mPipelineCacheDirty = true;
-    mLastPipelineCreatedMs = SDL_GetTicks64();
-    if (res != VK_SUCCESS) {
-        SPDLOG_ERROR("Vulkan: pipeline creation failed ({}) for shader {:x}/{:x}", (int)res, prg->shader_id0,
-                     prg->shader_id1);
+    if (vkCreateGraphicsPipelines(mDevice, mPipelineCache, 1, &pci, nullptr, &pipeline) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
     }
-    prg->pipelines[key] = pipeline;
     return pipeline;
+}
+
+// MARK: - Start-up prewarm
+
+void GfxRenderingAPIVK::LoadPrewarmList() {
+    std::ifstream in(PipelineListPath());
+    std::string line;
+    while (std::getline(in, line) && mSeenPipelines.size() < kMaxPrewarmPipelines) {
+        unsigned long long id0 = 0;
+        unsigned long long id1 = 0;
+        unsigned int key = 0;
+        const bool parsed = sscanf(line.c_str(), "%llx %llx %x", &id0, &id1, &key) == 3;
+        const uint32_t msaa = VkKeyMsaa(key);
+        if (!parsed || msaa == 0 || (msaa & (msaa - 1)) != 0 || (key >> 11) != 0) {
+            mSeenPipelinesDirty = true; // not a line this version writes; drop it at the next save
+            continue;
+        }
+        if (mSeenPipelines.emplace(id0, id1, key).second) {
+            mPrewarmList.emplace_back(id0, id1, key);
+        }
+    }
+    if (!mPrewarmList.empty()) {
+        SPDLOG_INFO("Vulkan: {} pipelines from earlier sessions to prewarm", mPrewarmList.size());
+    }
+}
+
+static bool VulkanTemplateAvailable() {
+    auto resourceManager = vk_resource_manager();
+    if (resourceManager == nullptr) {
+        return false;
+    }
+    auto init = std::make_shared<Ship::ResourceInitData>();
+    init->Type = (uint32_t)Ship::ResourceType::Shader;
+    init->ByteOrder = Ship::Endianness::Native;
+    init->Format = RESOURCE_FORMAT_BINARY;
+    return resourceManager->LoadResource("shaders/vulkan/default.shader.glsl", false, init) != nullptr;
+}
+
+// Once per frame until done. Rebuilds the saved programs for at most a few
+// milliseconds a frame (the SPIR-V is on disk, so this is mostly template
+// processing), then hands every pipeline to a worker thread.
+void GfxRenderingAPIVK::RunPrewarm() {
+    if (mPrewarmNext >= mPrewarmList.size()) {
+        return;
+    }
+    if (mPrewarmNext == 0) {
+        // The shader templates live in the game's archive, which the first-run
+        // extraction may still be writing.
+        if (mPrewarmFramesWaited++ % 120 != 0 || !VulkanTemplateAvailable()) {
+            return;
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + std::chrono::milliseconds(4);
+    ShaderProgramVK* const loaded = mShaderProgram; // the interpreter's current program
+    while (mPrewarmNext < mPrewarmList.size() && Clock::now() < deadline) {
+        const auto [id0, id1, key] = mPrewarmList[mPrewarmNext++];
+        const uint32_t msaa = VkKeyMsaa(key);
+        if (msaa > 1 && (mDeviceProps.limits.framebufferColorSampleCounts & msaa) == 0) {
+            continue; // saved on another GPU
+        }
+        CCFeatures features;
+        gfx_cc_get_features(id0, id1, &features);
+        if ((uint16_t)features.shader_id != 0xFFFF) {
+            continue;
+        }
+        ShaderProgramVK* prg = (ShaderProgramVK*)LookupShader(id0, id1);
+        if (prg == nullptr) {
+            prg = (ShaderProgramVK*)CreateAndLoadNewShader(id0, id1);
+        }
+        if (prg->pipelines.count(key) == 0) {
+            mPrewarmJobs.push_back({ prg, key, GetRenderPass(msaa, VkKeyHasDepth(key)), VK_NULL_HANDLE });
+        }
+    }
+    mShaderProgram = loaded;
+
+    if (mPrewarmNext < mPrewarmList.size() || mPrewarmJobs.empty()) {
+        return;
+    }
+    SPDLOG_INFO("Vulkan: building {} prewarmed pipelines on a worker thread", mPrewarmJobs.size());
+    mPrewarmWorker = std::thread([this]() {
+        for (size_t i = 0; i < mPrewarmJobs.size(); i++) {
+            PrewarmJob& job = mPrewarmJobs[i];
+            job.pipeline = CreatePipeline(*job.prg, job.key, job.pass);
+            mPrewarmJobsDone.store(i + 1, std::memory_order_release);
+        }
+    });
+}
+
+// Render thread, between draws: adopt what the worker has finished. A
+// pipeline the game needed sooner was built on the spot; the worker's copy of
+// it is dropped.
+void GfxRenderingAPIVK::MergePrewarmedPipelines() {
+    const size_t done = mPrewarmJobsDone.load(std::memory_order_acquire);
+    for (; mPrewarmJobsMerged < done; mPrewarmJobsMerged++) {
+        PrewarmJob& job = mPrewarmJobs[mPrewarmJobsMerged];
+        if (job.pipeline == VK_NULL_HANDLE) {
+            continue;
+        }
+        if (job.prg->pipelines.emplace(job.key, job.pipeline).second) {
+            mPipelineCacheDirty = true;
+            mLastPipelineCreatedMs = SDL_GetTicks64();
+        } else {
+            vkDestroyPipeline(mDevice, job.pipeline, nullptr);
+        }
+    }
+    if (mPrewarmJobsMerged == mPrewarmJobs.size() && mPrewarmWorker.joinable()) {
+        mPrewarmWorker.join();
+        SPDLOG_INFO("Vulkan: prewarm done");
+        mPrewarmJobs.clear();
+        mPrewarmJobsMerged = 0;
+        mPrewarmJobsDone.store(0, std::memory_order_relaxed);
+    }
+}
+
+void GfxRenderingAPIVK::FinishPrewarm() {
+    if (mPrewarmWorker.joinable()) {
+        mPrewarmWorker.join();
+    }
+    if (!mPrewarmJobs.empty()) {
+        MergePrewarmedPipelines();
+        mPrewarmJobs.clear();
+        mPrewarmJobsMerged = 0;
+        mPrewarmJobsDone.store(0, std::memory_order_relaxed);
+    }
 }
 
 void GfxRenderingAPIVK::WriteDrawUniformsIfDirty() {
@@ -1993,12 +2383,8 @@ void GfxRenderingAPIVK::StartFrame() {
     mFrameUniformsDirty = true;
 }
 
-void GfxRenderingAPIVK::EnsurePassActive(int fbId) {
+void GfxRenderingAPIVK::EnsureCommandBuffer(int fbId) {
     FramebufferVK& fb = mFramebuffers[fbId];
-    if (fb.mPassActive) {
-        return;
-    }
-
     if (fb.mCommandBuffer == VK_NULL_HANDLE) {
         VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
         ai.commandPool = mFrames[mFrameSlot].commandPool;
@@ -2029,15 +2415,36 @@ void GfxRenderingAPIVK::EnsurePassActive(int fbId) {
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
         }
     }
+}
+
+// Begins the framebuffer's render pass if it is not running. A pass begun to
+// clear (ClearFramebuffer before any draw) clears through its load ops.
+void GfxRenderingAPIVK::EnsurePassActive(int fbId, bool clearColor, bool clearDepth) {
+    FramebufferVK& fb = mFramebuffers[fbId];
+    if (fb.mPassActive) {
+        return;
+    }
+    EnsureCommandBuffer(fbId);
 
     if (fb.mFramebuffer == VK_NULL_HANDLE || fb.mRenderPass == VK_NULL_HANDLE) {
         return; // not a render target
     }
 
+    // Attachment order: color, then the MSAA resolve target, then depth.
+    VkClearValue clearValues[3] = {};
+    clearValues[0].color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+    clearValues[fb.mMsaaLevel > 1 ? 2 : 1].depthStencil = { 1.0f, 0 };
+
     VkRenderPassBeginInfo rpbi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
-    rpbi.renderPass = fb.mRenderPass;
+    rpbi.renderPass = clearColor || clearDepth
+                          ? GetRenderPass(fb.mMsaaLevel, fb.mHasDepthBuffer, clearColor, clearDepth)
+                          : fb.mRenderPass;
     rpbi.framebuffer = fb.mFramebuffer;
     rpbi.renderArea = { { 0, 0 }, { fb.mWidth, fb.mHeight } };
+    if (clearColor || clearDepth) {
+        rpbi.clearValueCount = (fb.mMsaaLevel > 1 ? 2u : 1u) + (fb.mHasDepthBuffer ? 1u : 0u);
+        rpbi.pClearValues = clearValues;
+    }
     vkCmdBeginRenderPass(fb.mCommandBuffer, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     fb.mPassActive = true;
 
@@ -2095,8 +2502,10 @@ void GfxRenderingAPIVK::StartDrawToFramebuffer(int fbId, float noiseScale) {
         }
     }
 
+    // The pass itself begins at the first draw or clear, so that a clear can
+    // become its load op.
     if (mFrameActive && fb.mRenderTarget) {
-        EnsurePassActive(fbId);
+        EnsureCommandBuffer(fbId);
     }
 }
 
@@ -2106,6 +2515,9 @@ void GfxRenderingAPIVK::ClearFramebuffer(bool color, bool depth) {
     }
     FramebufferVK& fb = mFramebuffers[mCurrentFramebuffer];
     if (!fb.mPassActive) {
+        if (mFrameActive && fb.mRenderTarget) {
+            EnsurePassActive(mCurrentFramebuffer, color, depth);
+        }
         return;
     }
 
@@ -2132,7 +2544,11 @@ void GfxRenderingAPIVK::ClearFramebuffer(bool color, bool depth) {
 
 void GfxRenderingAPIVK::ClearDepthRegion(int x, int y, int w, int h) {
     FramebufferVK& fb = mFramebuffers[mCurrentFramebuffer];
-    if (!fb.mPassActive || !fb.mHasDepthBuffer) {
+    if (!mFrameActive || !fb.mRenderTarget || !fb.mHasDepthBuffer) {
+        return;
+    }
+    EnsurePassActive(mCurrentFramebuffer);
+    if (!fb.mPassActive) {
         return;
     }
     int32_t sy = std::max(0, (int)mRenderTargetHeight - y - h);
@@ -2594,6 +3010,22 @@ void GfxRenderingAPIVK::EndFrame() {
     pi.swapchainCount = 1;
     pi.pSwapchains = &mSwapchain;
     pi.pImageIndices = &mSwapchainImageIndex;
+    const uint64_t presentId = ++mPresentId;
+    VkPresentIdKHR presentIdInfo = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+    VkPresentTimeGOOGLE presentTime = { (uint32_t)presentId, 0 };
+    VkPresentTimesInfoGOOGLE presentTimesInfo = { VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE };
+    const void** chain = &pi.pNext;
+    if (mHasPresentWait) {
+        presentIdInfo.swapchainCount = 1;
+        presentIdInfo.pPresentIds = &presentId;
+        *chain = &presentIdInfo;
+        chain = &presentIdInfo.pNext;
+    }
+    if (mHasDisplayTiming) {
+        presentTimesInfo.swapchainCount = 1;
+        presentTimesInfo.pTimes = &presentTime;
+        *chain = &presentTimesInfo;
+    }
     VkResult present = vkQueuePresentKHR(mQueue, &pi);
     if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR) {
         mSwapchainNeedsRecreate = true;
@@ -2625,7 +3057,8 @@ void GfxRenderingAPIVK::EndFrame() {
     }
     mDrawnFramebuffers.clear();
     mFrameActive = false;
-    mFrameSlot = (mFrameSlot + 1) % VK_FRAMES_IN_FLIGHT;
+    mFrameSlot = (mFrameSlot + 1) % mFramesInFlight;
+    ReportDisplayTimes();
     SavePipelineCacheIfIdle();
 }
 
