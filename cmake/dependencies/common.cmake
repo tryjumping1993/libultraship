@@ -39,7 +39,7 @@ endif()
 target_include_directories(ImGui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends PRIVATE ${SDL2_INCLUDE_DIRS})
 
 # ========= Vulkan =============
-if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
     if(WIN32 AND NOT DEFINED ENV{VULKAN_SDK} AND EXISTS "C:/VulkanSDK")
@@ -54,9 +54,65 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "And
         endforeach()
     endif()
 
+    # On Android the loader and headers come from the NDK sysroot.
     find_package(Vulkan QUIET)
 
-    if(Vulkan_FOUND AND NOT WIN32 AND NOT TARGET Vulkan::shaderc_shared)
+    # Android has no prebuilt shaderc, so build it, with glslang and
+    # SPIRV-Tools, from pinned sources (the revisions shaderc's DEPS names for
+    # that release). Any platform can opt in, which is how this path is tested
+    # off-device.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+        set(_lus_build_shaderc_default ON)
+    else()
+        set(_lus_build_shaderc_default OFF)
+    endif()
+    option(LUS_BUILD_SHADERC "Build shaderc from source for the Vulkan backend" ${_lus_build_shaderc_default})
+
+    set(LUS_SHADERC_FROM_SOURCE OFF)
+    if(Vulkan_FOUND AND LUS_BUILD_SHADERC)
+        FetchContent_Declare(lus_spirv_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Headers.git
+            GIT_TAG 01e0577914a75a2569c846778c2f93aa8e6feddd)
+        FetchContent_Declare(lus_spirv_tools
+            GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Tools.git
+            GIT_TAG 19042c8921f35f7bec56b9e5c96c5f5691588ca8)
+        FetchContent_Declare(lus_glslang
+            GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+            GIT_TAG d213562e35573012b6348b2d584457c3704ac09b)
+        FetchContent_Declare(lus_shaderc
+            GIT_REPOSITORY https://github.com/google/shaderc.git
+            GIT_TAG v2025.4)
+        # Sources only; shaderc's own third_party CMake adds them as subprojects.
+        foreach(_dep lus_spirv_headers lus_spirv_tools lus_glslang)
+            FetchContent_GetProperties(${_dep})
+            if(NOT ${_dep}_POPULATED)
+                FetchContent_Populate(${_dep})
+            endif()
+        endforeach()
+        set(SHADERC_SPIRV_HEADERS_DIR "${lus_spirv_headers_SOURCE_DIR}" CACHE STRING "" FORCE)
+        set(SHADERC_SPIRV_TOOLS_DIR "${lus_spirv_tools_SOURCE_DIR}" CACHE STRING "" FORCE)
+        set(SHADERC_GLSLANG_DIR "${lus_glslang_SOURCE_DIR}" CACHE STRING "" FORCE)
+        set(SHADERC_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SHADERC_SKIP_EXAMPLES ON CACHE BOOL "" FORCE)
+        set(SHADERC_SKIP_COPYRIGHT_CHECK ON CACHE BOOL "" FORCE)
+        set(SHADERC_SKIP_INSTALL ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
+        set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
+        set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
+        set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+        set(ENABLE_OPT OFF CACHE BOOL "" FORCE) # glslang's own optimizer hook; shaderc uses SPIRV-Tools directly
+        set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+        FetchContent_GetProperties(lus_shaderc)
+        if(NOT lus_shaderc_POPULATED)
+            FetchContent_Populate(lus_shaderc)
+            add_subdirectory(${lus_shaderc_SOURCE_DIR} ${lus_shaderc_BINARY_DIR} EXCLUDE_FROM_ALL)
+        endif()
+        set(LUS_SHADERC_FROM_SOURCE ON)
+    endif()
+    # Read by src/CMakeLists.txt to link the "shaderc" target built here.
+    set(LUS_SHADERC_FROM_SOURCE ${LUS_SHADERC_FROM_SOURCE} CACHE INTERNAL "shaderc built from source")
+
+    if(Vulkan_FOUND AND NOT WIN32 AND NOT TARGET Vulkan::shaderc_shared AND NOT LUS_SHADERC_FROM_SOURCE)
         # A distro's shaderc_combined is a static archive that does not actually bundle
         # glslang and SPIRV-Tools, so linking it leaves their symbols undefined. Prefer the
         # shared libshaderc where one is installed (Debian/Ubuntu name it plain "shaderc").
@@ -76,7 +132,9 @@ if (NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT CMAKE_SYSTEM_NAME STREQUAL "And
         target_sources(ImGui PRIVATE ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
         target_link_libraries(ImGui PUBLIC Vulkan::Vulkan)
 
-            if(WIN32 AND DEFINED ENV{VULKAN_SDK})
+        if(LUS_SHADERC_FROM_SOURCE)
+            message(STATUS "Vulkan rendering backend enabled (shaderc built from source)")
+        elseif(WIN32 AND DEFINED ENV{VULKAN_SDK})
             find_library(Vulkan_shaderc_shared_LIBRARY   NAMES shaderc_shared   HINTS "$ENV{VULKAN_SDK}/Lib" NO_DEFAULT_PATH)
             find_library(Vulkan_shaderc_shared_DEBUG_LIB NAMES shaderc_sharedd  HINTS "$ENV{VULKAN_SDK}/Lib" NO_DEFAULT_PATH)
             find_file(Vulkan_shaderc_shared_DLL       NAMES shaderc_shared.dll  HINTS "$ENV{VULKAN_SDK}/Bin" NO_DEFAULT_PATH)
